@@ -1,6 +1,10 @@
-import re 
-from pydantic import BaseModel, field_validator, model_validator
+import re
 import math
+from pathlib import Path
+from bs4 import BeautifulSoup
+from pydantic import BaseModel, field_validator
+
+# ---------- models ----------
 
 class Metric(BaseModel):
     label: str
@@ -14,7 +18,7 @@ class Metric(BaseModel):
         if math.isnan(v) or math.isinf(v):
             raise ValueError(f"value must be a finite number, got {v}")
         return round(v, 4)
-    
+
     @field_validator("unit")
     @classmethod
     def unit_must_be_valid(cls, v):
@@ -22,7 +26,7 @@ class Metric(BaseModel):
         if not any(v.startswith(p) for p in allowed_prefixes):
             raise ValueError(f"unrecognized unit '{v}'")
         return v
-    
+
     @field_validator("label")
     @classmethod
     def label_must_be_known(cls, v):
@@ -30,75 +34,197 @@ class Metric(BaseModel):
         if v not in known:
             raise ValueError(f"unknown label '{v}'")
         return v
-    
+
     def to_agent_dict(self) -> dict:
         return self.model_dump()
 
 
-SCALE = {"billion": 1_000_000_000, "million": 1_000_000, "thousand": 1_000,
-         "b": 1_000_000_000, "m": 1_000_000, "k": 1_000}
+# ---------- constants ----------
 
+SCALE = {
+    "billion": 1_000_000_000, "billions": 1_000_000_000,
+    "million": 1_000_000,     "millions": 1_000_000,
+    "thousand": 1_000,        "thousands": 1_000,
+    "b": 1_000_000_000, "m": 1_000_000, "k": 1_000,
+}
 
-def parse_number(raw_value: str, scale_word: str = "") -> float:
-    """Convert '$1.23 billion' style strings to floats."""
-    cleaned = re.sub(r'[,$\s]', '', raw_value)
-    cleaned = cleaned.replace('(', '-').replace(')', '')  # handle (losses)
-    num = float(cleaned)
-    multiplier = SCALE.get(scale_word.lower().strip(), 1)
-    return num * multiplier
+# Fix 2: map scale -> unit string that passes the Metric validator
+SCALE_UNIT_LABEL = {
+    1_000_000_000: "USD_billion",
+    1_000_000:     "USD_million",
+    1_000:         "USD_thousand",
+    1:             "USD_units",
+}
 
+LABEL_MAP = {
+    "revenue":                    "revenue",
+    "net revenues":               "revenue",
+    "net sales":                  "revenue",
+    "total net revenue":          "revenue",
+    "net income":                 "net_income",
+    "net earnings":               "net_income",
+    "net loss":                   "net_income",
+    "ebitda":                     "ebitda",
+    "earnings per share":         "eps",
+    "diluted earnings per share": "eps",
+    "gross margin":               "gross_margin",
+    "operating margin":           "op_margin",
+}
 
 PATTERNS = [
-    ("revenue",     r'(?:total\s+)?revenue[s]?\s+(?:of\s+)?\$?([\d,\.]+)\s*(billion|million|thousand|[BMK])?'),
-    ("net_income",  r'net\s+(?:income|earnings|loss)\s+(?:of\s+|was\s+)?\$?([\d,\.]+)\s*(billion|million|[BMK])?'),
-    ("ebitda",      r'ebitda\s+(?:of\s+|was\s+)?\$?([\d,\.]+)\s*(billion|million|[BMK])?'),
-    ("eps",         r'(?:diluted\s+)?(?:eps|earnings\s+per\s+share)\s+(?:of\s+)?\$?([\d,\.]+)'),
-    ("gross_margin",r'gross\s+(?:profit\s+)?margin\s+(?:of\s+|was\s+)?([\d\.]+)\s*%'),
-    ("op_margin",   r'operating\s+margin\s+(?:of\s+|was\s+)?([\d\.]+)\s*%'),
+    ("revenue",      r'(?:total\s+)?revenue[s]?\s+(?:of\s+)?\$?([\d,\.]+)\s*(billion|million|thousand|[BMK])?'),
+    ("net_income",   r'net\s+(?:income|earnings|loss)\s+(?:of\s+|was\s+)?\$?([\d,\.]+)\s*(billion|million|[BMK])?'),
+    ("ebitda",       r'ebitda\s+(?:of\s+|was\s+)?\$?([\d,\.]+)\s*(billion|million|[BMK])?'),
+    ("eps",          r'(?:diluted\s+)?(?:eps|earnings\s+per\s+share)\s+(?:of\s+)?\$?([\d,\.]+)'),
+    ("gross_margin", r'gross\s+(?:profit\s+)?margin\s+(?:of\s+|was\s+)?([\d\.]+)\s*%'),
+    ("op_margin",    r'operating\s+margin\s+(?:of\s+|was\s+)?([\d\.]+)\s*%'),
 ]
+
+
+# ---------- helpers ----------
+
+def parse_number(raw_value: str, scale_word: str = "") -> float:
+    cleaned = re.sub(r'[,$\s]', '', raw_value)
+    cleaned = cleaned.replace('(', '-').replace(')', '')
+    return float(cleaned) * SCALE.get(scale_word.lower().strip(), 1)
+
+
+def extract_scale_from_tag(tag) -> int:
+    """Fix 3: extract scale from a specific table or nearby caption, not the whole doc."""
+    scale_re = re.compile(r'in\s+(billions?|millions?|thousands?)', re.I)
+    # check the table's own text (captions, header rows, etc.)
+    text = tag.get_text(" ")
+    match = scale_re.search(text)
+    if match:
+        word = match.group(1).lower()
+        return SCALE.get(word, 1)
+    return 1
+
+
+def clean_cell(cell_text: str) -> tuple[str, bool]:
+    """Strip formatting; return (cleaned_str, is_negative)."""
+    c = cell_text.replace(',', '').replace('$', '').replace('\xa0', '').strip()
+    is_neg = c.startswith('(') and c.endswith(')')
+    return c.strip('()'), is_neg
+
+
+# ---------- extractors ----------
+
+def parse_financial_tables(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    rows = []
+
+    # Labels that should never be multiplied by table scale
+    UNSCALED_LABELS = {"gross_margin", "op_margin", "eps"}
+
+    for table in soup.find_all("table"):
+        table_scale = extract_scale_from_tag(table)
+        unit_label = SCALE_UNIT_LABEL.get(table_scale, "USD_units")
+
+        for tr in table.find_all("tr"):
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+            if len(cells) < 2:
+                continue
+
+            label_cell = cells[0].lower().strip().rstrip(':')
+            canonical = LABEL_MAP.get(label_cell)
+            if not canonical:
+                continue
+
+            for cell in cells[1:]:
+                cleaned, is_neg = clean_cell(cell)
+                try:
+                    # Don't multiply by table_scale when storing
+                    scale = 1  # always -- unit label already encodes the scale
+                    value = float(cleaned)
+                    if is_neg:
+                        value = -value
+
+                    if "margin" in canonical:
+                        unit = "percent"
+                    elif canonical == "eps":
+                        unit = "EPS_usd"
+                    else:
+                        unit = unit_label
+
+                    rows.append({
+                        "label": canonical,
+                        "value": round(value, 4),
+                        "unit": unit,
+                        "raw": cell,
+                    })
+                    break
+                except ValueError:
+                    continue
+
+    return rows
+
+
+def html_to_clean_text(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "header", "footer", "nav"]):
+        tag.decompose()
+    for tag in soup.find_all(["td", "th"]):
+        tag.insert_after(" | ")
+    for tag in soup.find_all("tr"):
+        tag.insert_after("\n")
+    text = soup.get_text(separator=" ")
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
 
 
 def parse_metrics(text: str) -> list[Metric]:
     results = []
     text_lower = text.lower()
-
     for label, pattern in PATTERNS:
         for match in re.finditer(pattern, text_lower):
             groups = match.groups()
             raw_val = groups[0]
             scale = groups[1] if len(groups) > 1 and groups[1] else ""
-
             try:
                 value = parse_number(raw_val, scale)
                 unit = "percent" if "margin" in label else f"USD_{scale or 'units'}"
-                results.append(
-                    Metric(label=label, value=value, unit=unit, raw=match.group(0))
-                )
-            except (ValueError, Exception) as e:
+                results.append(Metric(label=label, value=value, unit=unit, raw=match.group(0)))
+            except Exception as e:
                 print(f"skipped match for '{label}': {e}")
-                continue
-    
     return results
 
-if __name__ == "__main__":
-    from pathlib import Path
-    from load_txt import load_text_file
 
-    path = "10-K/AMAT/0000006951-21-000043/full-submission.txt"
-    
-    if not Path(path).exists():
+def parse_metrics_from_html(html: str) -> list[Metric]:
+    found: dict[str, Metric] = {}
+
+    for row in parse_financial_tables(html):
+        label = row["label"]
+        if label not in found:
+            try:
+                found[label] = Metric(**row)
+            except Exception as e:
+                print(f"skipped table row for '{label}': {e}")
+
+    if len(found) < len(PATTERNS):
+        clean_text = html_to_clean_text(html)
+        for m in parse_metrics(clean_text):
+            if m.label not in found:
+                found[m.label] = m
+
+    return list(found.values())
+
+
+# ---------- Fix 4: updated __main__ ----------
+
+if __name__ == "__main__":
+    path = Path("10-K/AMAT/0000006951-21-000043/full-submission.txt")
+
+    if not path.exists():
         print(f"file not found: {path}")
     else:
-        result = load_text_file(source=path)
-        
-        if result["error"]:
-            print(f"load error: {result['error']}")
-        else:
-            text = result["text"]
-            print(f"loaded {len(text):,} characters")
-            
-            metrics = parse_metrics(text)
-            print(f"found {len(metrics)} metrics\n")
-            
-            for m in metrics:
-                print(m.to_agent_dict())
+        # Read as plain text -- BeautifulSoup handles HTML regardless of file extension
+        html = path.read_text(encoding="utf-8", errors="replace")
+        print(f"loaded {len(html):,} characters")
+
+        metrics = parse_metrics_from_html(html)
+        print(f"found {len(metrics)} metrics\n")
+
+        for m in metrics:
+            print(m.to_agent_dict())
