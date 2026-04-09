@@ -40,7 +40,7 @@ class Metric(BaseModel):
 
 
 # ---------- constants ----------
-
+# map unit to multiplier
 SCALE = {
     "billion": 1_000_000_000, "billions": 1_000_000_000,
     "million": 1_000_000,     "millions": 1_000_000,
@@ -48,7 +48,7 @@ SCALE = {
     "b": 1_000_000_000, "m": 1_000_000, "k": 1_000,
 }
 
-# Fix 2: map scale -> unit string that passes the Metric validator
+# map scale -> unit string that passes the Metric validator
 SCALE_UNIT_LABEL = {
     1_000_000_000: "USD_billion",
     1_000_000:     "USD_million",
@@ -56,6 +56,7 @@ SCALE_UNIT_LABEL = {
     1:             "USD_units",
 }
 
+# normalize the label
 LABEL_MAP = {
     "revenue":                    "revenue",
     "net revenues":               "revenue",
@@ -71,6 +72,7 @@ LABEL_MAP = {
     "operating margin":           "op_margin",
 }
 
+# capture patterns
 PATTERNS = [
     ("revenue",      r'(?:total\s+)?revenue[s]?\s+(?:of\s+)?\$?([\d,\.]+)\s*(billion|million|thousand|[BMK])?'),
     ("net_income",   r'net\s+(?:income|earnings|loss)\s+(?:of\s+|was\s+)?\$?([\d,\.]+)\s*(billion|million|[BMK])?'),
@@ -84,13 +86,13 @@ PATTERNS = [
 # ---------- helpers ----------
 
 def parse_number(raw_value: str, scale_word: str = "") -> float:
-    cleaned = re.sub(r'[,$\s]', '', raw_value)
-    cleaned = cleaned.replace('(', '-').replace(')', '')
+    cleaned = re.sub(r'[,$\s]', '', raw_value) # strip commas, $, space. $1,234 -> 1234
+    cleaned = cleaned.replace('(', '-').replace(')', '') # accounting style: (123) -> -123
     return float(cleaned) * SCALE.get(scale_word.lower().strip(), 1)
 
 
 def extract_scale_from_tag(tag) -> int:
-    """Fix 3: extract scale from a specific table or nearby caption, not the whole doc."""
+    #extract scale from a specific table or nearby caption, not the whole doc.
     scale_re = re.compile(r'in\s+(billions?|millions?|thousands?)', re.I)
     # check the table's own text (captions, header rows, etc.)
     text = tag.get_text(" ")
@@ -102,7 +104,7 @@ def extract_scale_from_tag(tag) -> int:
 
 
 def clean_cell(cell_text: str) -> tuple[str, bool]:
-    """Strip formatting; return (cleaned_str, is_negative)."""
+    # strip spaces and indicate if it is negative
     c = cell_text.replace(',', '').replace('$', '').replace('\xa0', '').strip()
     is_neg = c.startswith('(') and c.endswith(')')
     return c.strip('()'), is_neg
@@ -110,32 +112,49 @@ def clean_cell(cell_text: str) -> tuple[str, bool]:
 
 # ---------- extractors ----------
 
+"""
+HTML input
+    │
+    ├─► parse_financial_tables()   ← primary: reads table structure
+    │       fills `found` dict
+    │
+    └─► if still missing metrics:
+            html_to_clean_text()   ← converts HTML to readable prose
+            parse_metrics()        ← runs regex patterns on that prose
+            fills gaps in `found`
+"""
+
+
+
 def parse_financial_tables(html: str) -> list[dict]:
+    # convert HTML string to a list of dictionaries with extracted metrics
     soup = BeautifulSoup(html, "lxml")
     rows = []
-
-    # Labels that should never be multiplied by table scale
-    UNSCALED_LABELS = {"gross_margin", "op_margin", "eps"}
 
     for table in soup.find_all("table"):
         table_scale = extract_scale_from_tag(table)
         unit_label = SCALE_UNIT_LABEL.get(table_scale, "USD_units")
 
         for tr in table.find_all("tr"):
+            # extract raw text separated by " "
             cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+            
+            # assume "label" + "value"
             if len(cells) < 2:
                 continue
-
+            
+            # normalize label
             label_cell = cells[0].lower().strip().rstrip(':')
             canonical = LABEL_MAP.get(label_cell)
             if not canonical:
                 continue
-
+            
+            # clean numeric cells
             for cell in cells[1:]:
                 cleaned, is_neg = clean_cell(cell)
                 try:
                     # Don't multiply by table_scale when storing
-                    scale = 1  # always -- unit label already encodes the scale
+                    # unit label already encodes the scale
                     value = float(cleaned)
                     if is_neg:
                         value = -value
@@ -161,6 +180,7 @@ def parse_financial_tables(html: str) -> list[dict]:
 
 
 def html_to_clean_text(html: str) -> str:
+    # convert html to text
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "header", "footer", "nav"]):
         tag.decompose()
@@ -194,6 +214,7 @@ def parse_metrics(text: str) -> list[Metric]:
 def parse_metrics_from_html(html: str) -> list[Metric]:
     found: dict[str, Metric] = {}
 
+    # prioritize table parsing
     for row in parse_financial_tables(html):
         label = row["label"]
         if label not in found:
@@ -202,6 +223,7 @@ def parse_metrics_from_html(html: str) -> list[Metric]:
             except Exception as e:
                 print(f"skipped table row for '{label}': {e}")
 
+    # parse text if label is missing
     if len(found) < len(PATTERNS):
         clean_text = html_to_clean_text(html)
         for m in parse_metrics(clean_text):
