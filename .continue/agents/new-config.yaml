@@ -1,0 +1,15 @@
+models:
+  - title: Claude Fast
+    provider: anthropic
+    model: claude-3-haiku-20240307
+
+  - title: Claude Smart
+    provider: anthropic
+    model: claude-3-5-sonnet-20241022
+
+defaultModel: Claude Smart
+
+tabAutocompleteModel:
+  title: Claude Fast
+  provider: anthropic
+  model: claude-3-haiku-20240307
