@@ -46,7 +46,7 @@ def run_parse_metrics(ticker: str, year: int) -> dict:
     }
 
 
-def run_calculate_ratios(ticker: str, year: int, price: float, shares_outstanding: float) -> dict:
+def run_calculate_ratios(ticker: str, year: int, price: float = 0.0, shares_outstanding: float = 0.0) -> dict:
     key = (ticker.upper(), year)
 
     if key not in _metrics_cache:
@@ -77,6 +77,7 @@ def run_calculate_ratios(ticker: str, year: int, price: float, shares_outstandin
 
 def dispatch(tool_name: str, tool_input: dict) -> str:
     """Execute the tool and return result as a JSON string."""
+    print(f"TOOL CALL: {tool_name}({tool_input})")  # temporary
     if tool_name == "parse_metrics":
         result = run_parse_metrics(
             ticker=tool_input["ticker"],
@@ -86,8 +87,8 @@ def dispatch(tool_name: str, tool_input: dict) -> str:
         result = run_calculate_ratios(
             ticker=tool_input["ticker"],
             year=tool_input["year"],
-            price=tool_input["price"],
-            shares_outstanding=tool_input["shares_outstanding"]
+            price=tool_input.get("price", 0.0),
+            shares_outstanding=tool_input.get("shares_outstanding", 0.0)
         )
     else:
         result = {"error": f"unknown tool: {tool_name}"}
@@ -108,13 +109,21 @@ When answering questions:
   "ANSWER: Insufficient data. [what is missing and why]"
   Do not speculate or use prior training knowledge to fill gaps.
 - Structure answers with a direct answer first, then supporting evidence
+- If a metric was flagged as missing or derived during tool execution, 
+  confidence must be "low". Never return "high" for estimated values.
 
 When analyzing financial metrics:
 - Calculate year-over-year changes when relevant
 - Put numbers in context using data available in the same filing 
   (e.g. compare to prior year figures, or to other segments in the same report)
 - Distinguish between GAAP and non-GAAP figures when both appear
-
+- Never infer year-over-year direction from a single year's data. Always retrieve both years before making comparisons.
+- Margin questions (net profit margin, gross margin, operating margin) always 
+  require calculate_ratios. Never return a raw dollar figure as a margin answer.
+- When calculate_ratios is called, the evidence array must contain the computed 
+  ratio result (e.g. pe_ratio=22.58), not the raw inputs used to compute it 
+  (e.g. eps=33.21). Never put raw metrics in evidence when a ratio was computed.
+  
 Format your responses as:
 ANSWER: [direct answer in 1-2 sentences]
 EVIDENCE: [specific data points with ticker, year, and metric name]

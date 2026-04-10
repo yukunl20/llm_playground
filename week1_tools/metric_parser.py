@@ -48,14 +48,6 @@ SCALE = {
     "b": 1_000_000_000, "m": 1_000_000, "k": 1_000,
 }
 
-# map scale -> unit string that passes the Metric validator
-SCALE_UNIT_LABEL = {
-    1_000_000_000: "USD_billion",
-    1_000_000:     "USD_million",
-    1_000:         "USD_thousand",
-    1:             "USD_units",
-}
-
 # normalize the label
 LABEL_MAP = {
     "revenue":                    "revenue",
@@ -66,8 +58,12 @@ LABEL_MAP = {
     "net earnings":               "net_income",
     "net loss":                   "net_income",
     "ebitda":                     "ebitda",
-    "earnings per share":         "eps",
-    "diluted earnings per share": "eps",
+    "diluted net income per share":   "eps",
+    "diluted earnings per share":     "eps",
+    "net income per diluted share":   "eps",
+    "earnings per diluted share":     "eps",
+    "basic earnings per share":       "eps",   
+    "earnings per share":             "eps",   
     "gross margin":               "gross_margin",
     "operating margin":           "op_margin",
 }
@@ -126,35 +122,44 @@ HTML input
 
 
 
+EPS_PRIORITY = {
+    "diluted net income per share":  3,
+    "net income per diluted share":  3,
+    "diluted earnings per share":    3,
+    "earnings per diluted share":    3,
+    "basic net income per share":    1,
+    "basic earnings per share":      1,
+    "earnings per share":            1,
+}
+
 def parse_financial_tables(html: str) -> list[dict]:
-    # convert HTML string to a list of dictionaries with extracted metrics
     soup = BeautifulSoup(html, "lxml")
     rows = []
+    eps_best_priority = -1  # track the best EPS row seen so far
 
     for table in soup.find_all("table"):
         table_scale = extract_scale_from_tag(table)
-        unit_label = SCALE_UNIT_LABEL.get(table_scale, "USD_units")
 
         for tr in table.find_all("tr"):
-            # extract raw text separated by " "
             cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-            
-            # assume "label" + "value"
             if len(cells) < 2:
                 continue
-            
-            # normalize label
+
             label_cell = cells[0].lower().strip().rstrip(':')
             canonical = LABEL_MAP.get(label_cell)
             if not canonical:
                 continue
+
+            # EPS priority filter: skip if we already have a better row
+            if canonical == "eps":
+                priority = EPS_PRIORITY.get(label_cell, 0)
+                # print(f"EPS candidate: label_cell={label_cell!r} priority={priority}")
+                if priority <= eps_best_priority:
+                    continue
             
-            # clean numeric cells
             for cell in cells[1:]:
                 cleaned, is_neg = clean_cell(cell)
                 try:
-                    # Don't multiply by table_scale when storing
-                    # unit label already encodes the scale
                     value = float(cleaned)
                     if is_neg:
                         value = -value
@@ -163,8 +168,15 @@ def parse_financial_tables(html: str) -> list[dict]:
                         unit = "percent"
                     elif canonical == "eps":
                         unit = "EPS_usd"
+                        eps_best_priority = EPS_PRIORITY.get(label_cell, 0)
+                        # print(f"EPS accepted: {label_cell!r} = {value}")
                     else:
-                        unit = unit_label
+                        value = value * table_scale
+                        unit = "USD_units"
+
+                    # remove any previous eps row if this one is better
+                    if canonical == "eps":
+                        rows = [r for r in rows if r["label"] != "eps"]
 
                     rows.append({
                         "label": canonical,
@@ -204,7 +216,7 @@ def parse_metrics(text: str) -> list[Metric]:
             scale = groups[1] if len(groups) > 1 and groups[1] else ""
             try:
                 value = parse_number(raw_val, scale)
-                unit = "percent" if "margin" in label else f"USD_{scale or 'units'}"
+                unit = "percent" if "margin" in label else "USD_units"
                 results.append(Metric(label=label, value=value, unit=unit, raw=match.group(0)))
             except Exception as e:
                 print(f"skipped match for '{label}': {e}")

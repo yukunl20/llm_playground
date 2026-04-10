@@ -23,19 +23,23 @@ def to_absolute(value: float, unit: str) -> float:
 
 class MarketInputs(BaseModel):
     """External inputs not available in the 10-K."""
-    price: float
-    shares_outstanding: float  # absolute number, e.g. 876_000_000
+    price: float = 0.0
+    shares_outstanding: float = 0.0
 
     @field_validator("price", "shares_outstanding")
     @classmethod
-    def must_be_positive(cls, v):
-        if v <= 0:
-            raise ValueError(f"must be positive, got {v}")
+    def must_be_non_negative(cls, v):  # was must_be_positive
+        if v < 0:
+            raise ValueError(f"must be non-negative, got {v}")
         return v
 
     @property
     def market_cap(self) -> float:
         return self.price * self.shares_outstanding
+
+    @property
+    def has_market_data(self) -> bool:
+        return self.price > 0 and self.shares_outstanding > 0
 
 
 class RatioResult(BaseModel):
@@ -104,7 +108,11 @@ class FinancialCalculator:
     # ---------- ratio methods ----------
 
     def pe_ratio(self):
+        if not self.market.has_market_data:
+            # print("pe_ratio skipped: no market data")
+            return
         eps = self._get("eps")
+        # print(f"pe_ratio: price={self.market.price} eps={eps}")
         if eps is None or eps == 0:
             return
         self._record(
@@ -115,6 +123,8 @@ class FinancialCalculator:
         )
 
     def ps_ratio(self):
+        if not self.market.has_market_data:
+            return
         revenue = self._get("revenue")
         if revenue is None or revenue == 0:
             return
@@ -126,10 +136,11 @@ class FinancialCalculator:
         )
 
     def ev_ebitda(self):
+        if not self.market.has_market_data:
+            return
         ebitda = self._get("ebitda")
         if ebitda is None or ebitda == 0:
             return
-        # simplified: EV = market_cap (excludes debt/cash -- extend later)
         self._record(
             label="ev_ebitda",
             value=self.market.market_cap / ebitda,
@@ -137,11 +148,26 @@ class FinancialCalculator:
             raw_inputs={"market_cap": self.market.market_cap, "ebitda": ebitda},
         )
 
+    def earnings_yield(self):
+        if not self.market.has_market_data:
+            return
+        eps = self._get("eps")
+        if eps is None:
+            return
+        self._record(
+            label="earnings_yield",
+            value=(eps / self.market.price) * 100,
+            formula="(eps / price) * 100",
+            raw_inputs={"eps": eps, "price": self.market.price},
+        )
+
     def net_margin(self):
         revenue = self._get("revenue")
         net_income = self._get("net_income")
         if revenue is None or net_income is None or revenue == 0:
+            # print(f"net_margin skipped: revenue={revenue} net_income={net_income}")
             return
+        # print(f"net_margin computing: {net_income} / {revenue}")
         self._record(
             label="net_margin",
             value=(net_income / revenue) * 100,
@@ -173,17 +199,7 @@ class FinancialCalculator:
             raw_inputs={"op_margin": om},
         )
 
-    def earnings_yield(self):
-        """Inverse of P/E -- useful for comparing against bond yields."""
-        eps = self._get("eps")
-        if eps is None or self.market.price == 0:
-            return
-        self._record(
-            label="earnings_yield",
-            value=(eps / self.market.price) * 100,
-            formula="(eps / price) * 100",
-            raw_inputs={"eps": eps, "price": self.market.price},
-        )
+
 
     def run_all(self) -> list[RatioResult]:
         self.pe_ratio()

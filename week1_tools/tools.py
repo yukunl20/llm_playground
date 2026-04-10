@@ -7,6 +7,7 @@ TOOLS = [
                 "Extracts financial metrics (revenue, net income, EPS, margins, EBITDA) "
                 "from a 10-K HTML filing. Call this first before calculating any ratios. "
                 "Returns a list of labeled metric objects with values and units."
+                "To compare across years, call this tool twice with different year values."
             ),
             "parameters": {
                 "type": "object",
@@ -29,9 +30,10 @@ TOOLS = [
         "function": {
             "name": "calculate_ratios",
             "description": (
-                "Computes financial ratios (P/E, P/S, EV/EBITDA, margins, earnings yield) "
-                "from previously parsed metrics. Requires parse_metrics to have been called first. "
-                "Needs a stock price and share count which you must ask the user for if not provided."
+                "Computes derived ratios that DO NOT exist in raw filings: "
+                "P/E, P/S, EV/EBITDA, net profit margin, gross margin, earnings yield. "
+                "parse_metrics returns raw dollar figures only. "
+                "You MUST call calculate_ratios for any question involving a margin or ratio."
             ),
             "parameters": {
                 "type": "object",
@@ -47,7 +49,7 @@ TOOLS = [
                         "description": "Total shares outstanding, absolute number e.g. 876000000"
                     }
                 },
-                "required": ["ticker", "year", "price", "shares_outstanding"]
+                "required": ["ticker", "year"]
             }
         }
     }
